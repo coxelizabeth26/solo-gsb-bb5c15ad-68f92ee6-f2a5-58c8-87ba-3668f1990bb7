@@ -5,6 +5,7 @@ Endpoints
 POST   /api/analyze                          analyze a rule set (optionally persist)
 POST   /api/analyses/{id}/simulate           preview add/replace/remove changes without saving
 POST   /api/analyses/{id}/merge-precheck     precheck merging two change batches on one base version
+POST   /api/analyses/{id}/quarantine-plan    derive a deterministic deny-only quarantine rule plan (preview only)
 GET    /api/analyses                         list saved analysis versions
 GET    /api/analyses/{id}                    fetch one version with the full result
 GET    /api/analyses/{id}/rules              query rules (filters: status/action/ip_version)
@@ -37,12 +38,14 @@ from .change_guard import ChangeGuardError, guard_changes, parse_guard_entries
 from .decision_map import DecisionMapError, build_decision_map, parse_query_cidr
 from .diff import ANALYSIS_ID_RE, diff_analyses
 from .merge_precheck import build_batch, merge_precheck
+from .quarantine import QuarantinePlanError, build_quarantine_plan
 from .redundant import redundant_rule_inventory
 from .schemas import (
     ActivateRequest,
     AnalyzeRequest,
     ChangeGuardRequest,
     MergePrecheckRequest,
+    QuarantinePlanRequest,
     SimulateRequest,
 )
 from .simulate import PatchError, apply_patch, rebuild_input_rules
@@ -92,6 +95,15 @@ async def _change_guard_error_handler(_request, exc: ChangeGuardError):
     return JSONResponse(
         status_code=400,
         content={"error": "invalid_change_guard", "detail": str(exc), "issues": exc.issues},
+    )
+
+
+@app.exception_handler(QuarantinePlanError)
+async def _quarantine_plan_error_handler(_request, exc: QuarantinePlanError):
+    # The whole generated plan is rejected (e.g. generated ids collide).
+    return JSONResponse(
+        status_code=400,
+        content={"error": "invalid_quarantine_plan", "detail": str(exc), "issues": exc.issues},
     )
 
 
@@ -248,6 +260,44 @@ def merge_precheck_changes(analysis_id: str, req: MergePrecheckRequest) -> dict[
         merged["name"] = None
         merged["created_at"] = db.utc_now_iso()
         merged["persisted"] = False
+    return result
+
+
+@app.post("/api/analyses/{analysis_id}/quarantine-plan", status_code=200)
+def quarantine_plan(analysis_id: str, req: QuarantinePlanRequest) -> dict[str, Any]:
+    """Derive a deterministic temporary deny-only ("quarantine") rule plan.
+
+    Given a strict target CIDR and a new-rule id prefix, the address blocks
+    inside the target that currently resolve to ``permit`` or match no rule
+    (``none``) are turned into a deterministic list of brand-new ``deny``
+    rules at ``priority = 0`` with ids ``<prefix>1``, ``<prefix>2`` ...;
+    addresses already denied generate no rule.  Where an existing same-CIDR
+    ``priority = 0`` permit rule would win the tie, the target is subdivided
+    into longer prefixes; if a single address still cannot be overridden the
+    plan is ``generatable: false`` and that address is reported as a blocking
+    range.  The candidate is rebuilt and re-verified with the existing
+    analysis and semantic-diff machinery: on success the target is deny
+    end-to-end and every address outside it keeps its final action.
+
+    Preview only: no analysis version is created and nothing is persisted.
+    """
+    # CIDR format is validated before the version lookup, mirroring the
+    # decision-map endpoint's format-before-existence ordering.
+    target = parse_query_cidr(req.cidr)
+
+    base = db.get_analysis(analysis_id)
+    if base is None:
+        raise HTTPException(status_code=404, detail=f"analysis '{analysis_id}' not found")
+
+    result = build_quarantine_plan(base, target, req.rule_id_prefix)
+
+    candidate = result.get("candidate")
+    if candidate is not None:
+        # The candidate is an unsaved preview exactly like simulate/merge.
+        candidate["id"] = None
+        candidate["name"] = None
+        candidate["created_at"] = db.utc_now_iso()
+        candidate["persisted"] = False
     return result
 
 

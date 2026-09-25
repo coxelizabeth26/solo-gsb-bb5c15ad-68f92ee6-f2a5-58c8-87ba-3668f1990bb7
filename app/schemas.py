@@ -162,6 +162,28 @@ class ChangeGuardRequest(BaseModel):
     )
 
 
+class QuarantinePlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cidr: str = Field(
+        ...,
+        description="Strict IPv4/IPv6 quarantine target: explicit prefix length, host bits must be zero",
+    )
+    rule_id_prefix: str = Field(
+        ...,
+        description="Prefix of the generated deny rule ids; ids are '<prefix>1', '<prefix>2', ...; "
+        "none may already exist in the saved version"
+    )
+
+    @field_validator("cidr", "rule_id_prefix")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("must not be empty")
+        return v
+
+
 class ActivateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -96,6 +96,7 @@ N 的实际覆盖碎片。
 | POST | `/api/analyze` | 分析规则集（默认保存；`save:false` 只算不存） |
 | POST | `/api/analyses/{id}/simulate` | 基于已保存版本预演 add/replace/remove 规则变更（**不落库**），返回新分析结果与语义差异 |
 | POST | `/api/analyses/{id}/merge-precheck` | **双批次变更合并预检**：A、B 两组 add/replace/remove 基于同一基线分别重算，检测结构冲突/地址动作冲突/合并冲突（**不落库**），无冲突时返回合并分析与相对基线差异 |
+| POST | `/api/analyses/{id}/quarantine-plan` | **临时封禁方案预演**：给定严格 CIDR 目标与新规则 ID 前缀，确定性生成 `priority=0` 的 deny 新增规则清单（已有 deny 不生成、撞同网段 priority 0 permit 自动细分、单地址仍不胜出则报告阻碍网段），复算候选并返回目标内转 deny 的 CIDR 与地址数（**不落库**） |
 | GET | `/api/analyses` | 列出已保存版本（`limit`/`offset` 分页） |
 | GET | `/api/analyses/{id}` | 取某个版本的完整分析结果 |
 | GET | `/api/analyses/{id}/rules` | 查询规则：`status=active/partial/shadowed`、`action=permit/deny`、`ip=4/6` |
@@ -401,6 +402,150 @@ curl -s -X POST http://localhost:8080/api/analyses/an_e38b58f57faf2325/merge-pre
 - 批次内新增/替换规则 CIDR、action 非法 → `400 invalid_ruleset`；
 - 字段层面错误（缺 `a`/`b`、未知顶层字段、操作对象多余字段、未知 action 等）→ `422`；
 - 基准版本不存在 → `404`。
+
+### 已保存规则集的临时封禁方案（quarantine plan）
+
+`POST /api/analyses/{id}/quarantine-plan` 在**已保存版本**之上，针对一个**严格 CIDR 目标**
+（`cidr`，主机位为 0、必须带前缀长度）和一个**新规则 ID 前缀**（`rule_id_prefix`），
+确定性地生成一组全新的 **deny 临时封禁规则**，使目标内的**每个地址最终都裁决为 deny**，
+而目标外所有地址的最终动作保持不变。纯网段几何运算 + 现有 LPM 分析与语义差异复算，
+**不新建分析版本、不写库、不修改基线**，只做预演，可安全重复调用。
+
+生成规则（全部为 `action: "deny"`、`priority: 0`、`source_tag: "quarantine"`）：
+
+1. **已经是 deny 的地址不生成规则**——目标内当前生效 deny 的区域直接跳过，响应里用
+   `already_deny` 单独报告（最小 CIDR + 地址数）；
+2. 目标内当前 **permit 或未匹配（none）** 的区域，按 LPM/同网段优先级裁决结果生成规则：
+   - 区域只被 `priority > 0` 的 permit 规则（或完全没有规则）覆盖 → 在该区域 CIDR 上
+     生成一条 priority 0 deny，同网段裁决中 priority 0 胜出（新规则追加在基线条目之后，
+     仅在 priority 严格更小时胜出）；
+   - 区域边界上存在 **同网段 `priority = 0` 的原 permit 规则**时，同网段无法胜出 →
+     **把该网段细分为两个更长子网**，递归处理每个子网（更长前缀天然压过 priority 0 规则），
+     已存在的 deny 子段不生成冗余规则；
+   - 细分到**单地址**（IPv4 `/32`、IPv6 `/128`）仍撞上同网段 priority 0 permit 原规则 →
+     该地址无法封禁，方案标记为 `generatable: false`，并在 `blocking` 中报告**阻碍网段**
+     （主机路由 CIDR、阻碍原规则的 `rule_id`/`action`/`priority`）；
+3. 新规则 ID 按 `<前缀>1`、`<前缀>2`、…… 依 CIDR 规范顺序连续生成；**任一生成 ID 与基线
+   已有规则 ID 冲突** → 整个请求 `400 invalid_quarantine_plan`，`issues` 一次列出全部冲突；
+4. 生成后服务端**重建候选输入并用现有分析器重算**，再以**语义差异**和**决策地图**复核：
+   成功时候选相对基线只有 `permit→deny` / `none→deny` 两类变化且全部严格位于目标内，
+   目标决策地图逐块均为 deny；响应给出完整未保存候选分析 `candidate`、目标内候选决策
+   `candidate_decisions`、语义差异 `diff`，以及目标内**实际转为 deny 的最小 CIDR**
+   （`converted.cidrs`）与**地址数**（`converted.address_count`，IPv6 大整数精确给出）。
+
+```bash
+curl -s -X POST http://localhost:8080/api/analyses/an_e38b58f57faf2325/quarantine-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"cidr": "10.10.0.0/16", "rule_id_prefix": "q-2026-"}'
+```
+
+生成成功响应（节选；基线 `permit 10.0.0.0/8 → deny 10.10.0.0/16 → permit 10.10.1.0/24`，
+目标内仅 permit 的 `/24` 需要新规则，其余 65280 个地址本就 deny）：
+
+```json
+{
+  "base": {"id": "an_e38b58f57faf2325", "ruleset_hash": "e38b58f5...", "analyzer_version": "1.0.0"},
+  "target_cidr": "10.10.0.0/16",
+  "ip_version": 4,
+  "rule_id_prefix": "q-2026-",
+  "generatable": true,
+  "rules": [
+    {"rule_id": "q-2026-1", "cidr": "10.10.1.0/24", "action": "deny",
+     "priority": 0, "source_tag": "quarantine"}
+  ],
+  "blocking": [],
+  "converted": {
+    "cidrs": ["10.10.1.0/24"],
+    "range_count": 1,
+    "address_count": 256,
+    "by_change": [
+      {"ip_version": 4, "change_type": "permit_to_deny",
+       "from_action": "permit", "to_action": "deny",
+       "address_count": 256, "range_count": 1, "cidrs": ["10.10.1.0/24"]}
+    ]
+  },
+  "already_deny": {
+    "cidrs": ["10.10.0.0/24", "10.10.2.0/23", "..."],
+    "range_count": 8,
+    "address_count": 65280
+  },
+  "candidate": {
+    "id": null, "name": null, "persisted": false,
+    "rules": ["...基线规则 + 新增 deny 规则的完整分析结果..."],
+    "findings": ["..."], "minimal_conflict_pairs": ["..."]
+  },
+  "candidate_decisions": {
+    "target_cidr": "10.10.0.0/16", "ip_version": 4,
+    "summary": {"block_count": 9, "deny_addresses": 65536,
+                "permit_addresses": 0, "unmatched_addresses": 0, "total_addresses": 65536},
+    "blocks": [{"cidr": "10.10.0.0/24", "address_count": 256, "action": "deny", "...": "..."}]
+  },
+  "diff": {
+    "base":   {"id": "an_e38b58f57faf2325", "ruleset_hash": "e38b58f5...", "analyzer_version": "1.0.0"},
+    "target": {"id": null, "ruleset_hash": "....", "analyzer_version": "1.0.0"},
+    "changes": [
+      {"ip_version": 4, "change_type": "permit_to_deny",
+       "from_action": "permit", "to_action": "deny",
+       "address_count": 256, "range_count": 1, "cidrs": ["10.10.1.0/24"]}
+    ]
+  },
+  "summary": {
+    "generated_rule_count": 1,
+    "blocking_range_count": 0,
+    "blocking_address_count": 0,
+    "converted_address_count": 256,
+    "already_deny_address_count": 65280,
+    "target_address_count": 65536
+  }
+}
+```
+
+细分示例：基线在 `10.1.0.0/24` 上已有一条 **priority 0 permit** 原规则时，同网段的新
+deny 无法在优先级上胜出，方案自动把目标细分为 `/25` 兄弟网段，生成两条更长前缀规则：
+
+```json
+{
+  "generatable": true,
+  "rules": [
+    {"rule_id": "tmp1", "cidr": "10.1.0.0/25",   "action": "deny", "priority": 0, "source_tag": "quarantine"},
+    {"rule_id": "tmp2", "cidr": "10.1.0.128/25", "action": "deny", "priority": 0, "source_tag": "quarantine"}
+  ],
+  "converted": {"cidrs": ["10.1.0.0/24"], "range_count": 1, "address_count": 256}
+}
+```
+
+不可生成响应（示例：目标内存在一条 `10.1.2.3/32` 的 priority 0 permit 原规则，细分到
+单地址仍无法胜出）：
+
+```json
+{
+  "generatable": false,
+  "rules": null,
+  "converted": null,
+  "candidate": null,
+  "candidate_decisions": null,
+  "diff": null,
+  "blocking": [
+    {"cidr": "10.1.2.3/32", "address_count": 1,
+     "rule_id": "z", "action": "permit", "priority": 0}
+  ],
+  "already_deny": {"cidrs": [], "range_count": 0, "address_count": 0},
+  "summary": {"generated_rule_count": 0, "blocking_range_count": 1,
+              "blocking_address_count": 1, "converted_address_count": 0,
+              "already_deny_address_count": 0, "target_address_count": 65536}
+}
+```
+
+错误码：
+
+- 目标 CIDR 非法（语法错误、主机位非零如 `10.0.0.5/24`、缺前缀长度等）→ `400`
+  `invalid_cidr`（**先校验 CIDR，再查版本**）；
+- 生成的规则 ID 与基线已有 ID 冲突 → `400 invalid_quarantine_plan`，
+  形如 `{"error": "invalid_quarantine_plan", "issues": ["generated rule_id 'q1' already exists ..."]}`；
+- 字段层面错误（缺 `cidr`/`rule_id_prefix`、空前缀、未知顶层字段等）→ `422`；
+- 基准版本不存在 → `404`。
+- 不可生成（存在阻碍网段）不是错误：HTTP 仍为 `200`，由响应体 `generatable: false`
+  与 `blocking` 表达；接口始终只预演，成功与失败都不落库。
 
 ### 已保存版本的 CIDR 决策地图（decision map）
 
@@ -777,6 +922,10 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
   `{"error": "invalid_cidr", "detail": "invalid CIDR '10.0.0.5/24' (...)"}`
 - 变更守卫授权集非法（授权 CIDR 非严格 CIDR、异类授权相互重叠等）→ `400`，形如
   `{"error": "invalid_change_guard", "detail": "...", "issues": ["...全部问题..."]}`
+- 临时封禁方案的目标 CIDR 非法（主机位非零、缺前缀长度等）→ `400`，形如
+  `{"error": "invalid_cidr", "detail": "invalid CIDR '10.0.0.5/24' (...)"}`；
+  生成的规则 ID 撞基线已有 ID → `400 invalid_quarantine_plan`（不可生成的阻碍网段为
+  `200` 正常响应，由 `generatable: false` 表达，不是错误）
 - 发布指针的 `expected_revision` 与当前 revision 不一致（并发发布冲突）→ `409`，形如
   `{"error": "revision_conflict", "detail": "...", "current": {"active_id": "...", "revision": 2}}`
 - 字段类型/取值错误（未知 action、空规则列表、多余字段、缺少必填查询参数等）→ `422`（Pydantic 校验错误）
@@ -797,6 +946,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 │   ├── redundant.py     # 冗余规则盘点：逐条移除 + 重算 LPM + 语义差异比较（纯函数，可独立使用）
 │   ├── simulate.py      # 变更预演：从已保存版本重建输入 + add/replace/remove 批次校验与打补丁（纯函数）
 │   ├── merge_precheck.py # 双批次合并预检：两侧分别重算 + 改变范围精确叠加 + A 后 B 合并重算（纯函数）
+│   ├── quarantine.py    # 临时封禁方案：目标网段几何递归细分生成 priority 0 deny 规则 + 候选复算复核（纯函数）
 │   ├── schemas.py       # Pydantic v2 请求/响应模型
 │   ├── db.py            # SQLite 持久层（analyses / rules / findings / active_pointer / active_history 五表）
 │   └── main.py          # FastAPI 路由
@@ -808,6 +958,7 @@ curl -s "http://localhost:8080/api/active/history?limit=50&offset=0"
 ├── tests/test_redundant_rules.py # 冗余规则盘点端点测试
 ├── tests/test_simulate.py      # 规则变更预演端点测试
 ├── tests/test_merge_precheck.py # 双批次合并预检端点测试
+├── tests/test_quarantine_plan.py # 临时封禁方案端点测试
 ├── requirements.txt
 ├── Dockerfile          # 非 root 运行、内置 HEALTHCHECK、暴露 8080
 ├── docker-compose.yml  # 单命令启动 + 命名卷持久化
